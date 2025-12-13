@@ -6,7 +6,7 @@ conda activate da3
 module load gcc ffmpeg
 
 seq_name=$1
-output_dir=/scratch/izar/cizinsky/thesis/results/$seq_name
+output_dir=/scratch/izar/cizinsky/thesis/preprocessing/$seq_name
 mkdir -p $output_dir
 cd submodules/da3
 python inference.py --output_dir $output_dir
