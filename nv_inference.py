@@ -27,12 +27,27 @@ def root_dir_to_depths_dir(root_dir: Path, cam_id: int) -> Path:
 def root_dir_to_depths_debug_dir(root_dir: Path, cam_id: int) -> Path:
     return root_dir / "est_depths_debug" / f"{cam_id}"
 
+def root_dir_to_mask_dir(root_dir: Path, cam_id: int) -> Path:
+    return root_dir / "seg" / "img_seg_mask" / f"{cam_id}" / "all"
+
 @dataclass
 class Args:
     """Run Depth Anything 3 metric model over frames and save depth maps."""
 
     scene_dir: Annotated[Path, tyro.conf.arg(help="Base output directory containing frames/")]
     camera_id: Annotated[int, tyro.conf.arg(help="Camera ID to process")] = 4
+
+def load_mask(path: Path, eps: float = 0.05, device="cuda") -> torch.Tensor:
+    arr = torch.from_numpy(np.array(Image.open(path))).float()  # HxWxC or HxW
+    if arr.dim() == 2:
+        arr = arr.unsqueeze(-1) / 255.0  # HxWx1
+        return arr.to(device) # already binary mask
+
+    if arr.shape[-1] == 4:
+        arr = arr[..., :3] # drop alpha
+    # Foreground is any pixel whose max channel exceeds eps*255
+    mask = (arr.max(dim=-1).values > eps * 255).float()  # HxW
+    return mask.to(device).unsqueeze(-1)  # HxWx1, range [0,1]
 
 
 def load_frames(frames_dir: Path):
@@ -142,13 +157,31 @@ def save_depth_maps(depth_np: np.ndarray, frame_paths, scene_dir: Path, cam_id: 
 
 def main():
     args = tyro.cli(Args)
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     # Prepare images to infer the depth on
     frames_dir = root_dir_to_image_dir(args.scene_dir, args.camera_id)
     frame_paths, images = load_frames(frames_dir)
 
+    # For debug
+#    if args.camera_id == 4:
+        #print("Applying masks for camera 4")
+        ## Load corresponding masks
+        #masks = []
+        #mask_dir = root_dir_to_mask_dir(args.scene_dir, args.camera_id)
+        #for fp in frame_paths:
+            #fname = fp.stem  # e.g., "000001"
+            #mask_path = mask_dir / f"{fname}.png"
+            #mask = load_mask(mask_path, eps=0.05, device=device)  # HxWx1
+            #masks.append(mask)
+
+        ## Apply masks to images
+        #for i in range(len(images)):
+            #img_arr = torch.from_numpy(np.array(images[i])).float().to(device)  # HxWx3
+            #masked_img_arr = img_arr * masks[i]  # HxWx3
+            #images[i] = Image.fromarray(masked_img_arr.byte().cpu().numpy())
+
     # Load model
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model = DepthAnything3.from_pretrained("depth-anything/da3metric-large").to(device)
 
     # Run inference
@@ -165,15 +198,19 @@ def main():
     cam_path = root_dir_to_cameras_path(args.scene_dir)
     K = load_intrinsics_from_npz(cam_path, args.camera_id).to(device)
     fx, fy = K[0, 0], K[1, 1]
+    print(f"Loaded intrinsics for camera {args.camera_id}: fx={fx}, fy={fy}")
 
     # - Compute original and inferred image sizes
-    W_orig, _ = images[0].size
-    _, _, W_infer, _ = prediction.processed_images.shape
+    W_orig, H_orig = images[0].size
+    _, H_infer, W_infer, _ = prediction.processed_images.shape
+    print(f"Original image size: {W_orig}x{H_orig}, Inference size: {W_infer}x{H_infer}")
 
     # - Compute effective focal length and metric depth
     # (since the intrinsics are in the original resolution, we need to scale them accordingly)
-    focal_orig = float((fx + fy) / 2)
-    focal_eff = focal_orig * (W_infer / W_orig)
+    # focal_orig = float((fx + fy) / 2)
+    fx_eff = float(fx) * (W_infer / W_orig)
+    fy_eff = float(fy) * (H_infer / H_orig)
+    focal_eff = (fx_eff + fy_eff) / 2
     metric_depth = focal_eff * prediction.depth / 300
     if torch.is_tensor(metric_depth):
         metric_depth = metric_depth.detach().float().cpu().numpy()
